@@ -1,4 +1,3 @@
-
   const STORAGE_KEY = 'scanshop_ai_products_v1';
   const CLOUD_URL_KEY = 'scanshop_ai_cloud_url_v1';
   const CATEGORIES = ['Elektronik','Mode & Accessoires','Haushalt & Wohnen','Lebensmittel & Getränke','Sport & Freizeit','Beauty & Pflege','Büro & Schreibwaren','Sonstiges'];
@@ -22,6 +21,10 @@
 
     loadFromLocalStorage();
     renderProducts();
+    setTheme(localStorage.getItem(THEME_KEY)||'black-gold-white');
+    updateAccountStatus(); renderCart();
+    const aiSaved=localStorage.getItem(AI_URL_KEY);if(aiSaved)$('aiEndpointInput').value=aiSaved;
+    setTimeout(initAreaMap,250);
 
     const savedUrl = localStorage.getItem(CLOUD_URL_KEY);
     if (savedUrl) $('cloudEndpointInput').value = savedUrl;
@@ -138,6 +141,16 @@
     let confidencePct = '';
     let detailsText = 'Automatisch erfasstes Produkt.';
 
+    let barcode='';
+    try { barcode=await readBarcode(imgElement); } catch(e) {}
+    let ocrText='';
+    try {
+      if(window.Tesseract && currentImageDataUrl){
+        const ocr=await Tesseract.recognize(currentImageDataUrl,'eng+deu');
+        ocrText=addOcrText(ocr.data.text);
+      }
+    } catch(e) { console.warn('OCR unavailable',e); }
+    const enriched=await enrichProductFromImage(imgElement,barcode);
     if (mobilenetModel) {
       try {
         const predictions = await mobilenetModel.classify(imgElement);
@@ -153,10 +166,17 @@
       } catch (err) { console.error('Analysefehler:', err); }
     }
 
+    if(enriched?.name)detectedName=enriched.name;
+    if(enriched?.category && CATEGORIES.includes(enriched.category))detectedCategory=enriched.category;
     $('prodName').value = detectedName;
     $('prodCategory').value = detectedCategory;
-    $('prodSku').value = 'SKU-' + Date.now().toString().slice(-6);
-    $('prodDesc').value = detailsText;
+    $('prodSku').value = enriched?.sku || (barcode ? 'EAN-'+barcode : 'SKU-' + Date.now().toString().slice(-6));
+    if($('prodIsbn'))$('prodIsbn').value=enriched?.isbn || barcode || '';
+    const sourceText=ocrText ? `Text detected on image: ${ocrText}` : 'No readable packaging text detected.';
+    const identityText=enriched?.description || detailsText;
+    $('prodDesc').value = [identityText,sourceText,enriched?.brand?`Brand: ${enriched.brand}`:'',enriched?.size?`Pack size: ${enriched.size}`:'',enriched?.priceSource?`Price source: ${enriched.priceSource}`:''].filter(Boolean).join('\n\n');
+    if(enriched?.price && Number(enriched.price)>0)$('prodPrice').value=Number(enriched.price).toFixed(2);
+    else if (!$('prodPrice').value) $('prodPrice').value = '';
     $('prodConfidence').value = confidencePct;
     if (!$('prodPrice').value) $('prodPrice').value = '19.99';
 
@@ -186,6 +206,7 @@
       price: parseFloat($('prodPrice').value) || 0,
       category: $('prodCategory').value,
       sku: $('prodSku').value.trim() || 'SKU-' + Date.now().toString().slice(-6),
+      isbn: $('prodIsbn')?.value.trim() || '', seller: localStorage.getItem('scanshop_demo_session') || '', location: '', lat: null, lng: null,
       description: $('prodDesc').value.trim(),
       confidence: $('prodConfidence').value,
       image: currentImageDataUrl || PLACEHOLDER_IMG,
@@ -198,7 +219,6 @@
   }
 
   async function triggerAutosave() {
-    updateSyncStatus('saving', 'Speichert...');
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
     } catch (e) {
@@ -207,26 +227,15 @@
     const cloudUrl = localStorage.getItem(CLOUD_URL_KEY);
     if (cloudUrl) {
       try {
-        const res = await fetch(cloudUrl, {
+        await fetch(cloudUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ updatedAt: new Date().toISOString(), totalProducts: products.length, products })
         });
-        if (res.ok) { updateSyncStatus('online', 'Lokal & Online synchronisiert'); return; }
-        updateSyncStatus('warning', 'Online-Sync fehlgeschlagen');
-        return;
       } catch (err) {
-        updateSyncStatus('warning', 'Lokal gesichert (Offline)');
-        return;
+        console.warn('Online-Sync nicht erreichbar (lokal gesichert).', err);
       }
     }
-    setTimeout(() => updateSyncStatus('local', 'Lokal automatisch gespeichert'), 300);
-  }
-
-  function updateSyncStatus(state, text) {
-    $('syncText').textContent = text;
-    const cls = { saving: 'bg-warning', online: 'bg-primary', warning: 'bg-danger' }[state] || 'bg-success';
-    $('syncDot').className = 'status-dot ' + cls;
   }
 
   function loadFromLocalStorage() {
@@ -248,7 +257,7 @@
       (cat === 'ALL' || p.category === cat) &&
       ((p.name || '').toLowerCase().includes(searchTerm) ||
        (p.description || '').toLowerCase().includes(searchTerm) ||
-       (p.sku || '').toLowerCase().includes(searchTerm)));
+       (p.sku || '').toLowerCase().includes(searchTerm) || (p.isbn || '').toLowerCase().includes(searchTerm) || (p.seller || '').toLowerCase().includes(searchTerm)) && inGeofence(p));
 
     if (!filtered.length) {
       grid.innerHTML = '';
@@ -259,7 +268,7 @@
 
     grid.innerHTML = filtered.map(p => `
       <div class="col-12 col-sm-6 col-lg-4 col-xl-3">
-        <div class="card product-card">
+        <div class="card product-card" data-open-product="${escapeHtml(p.id)}">
           <div class="product-img-wrapper">
             <span class="category-badge">${escapeHtml(p.category)}</span>
             ${p.confidence ? `<span class="ai-confidence-badge">KI ${escapeHtml(p.confidence)}</span>` : ''}
@@ -274,6 +283,7 @@
             <p class="card-text text-muted small flex-grow-1 desc-clamp">${escapeHtml(p.description || 'Keine weiteren Details vorhanden.')}</p>
             <div class="d-flex gap-2 mt-3 pt-2 border-top">
               <button type="button" class="btn btn-sm btn-outline-primary flex-grow-1" data-action="edit" data-id="${escapeHtml(p.id)}"><i class="bi bi-pencil-square me-1"></i> Bearbeiten</button>
+              <button type="button" class="btn btn-sm btn-primary-shop" data-action="cart" data-id="${escapeHtml(p.id)}" title="Add to cart"><i class="bi bi-cart-plus"></i></button>
               <button type="button" class="btn btn-sm btn-outline-danger" data-action="delete" data-id="${escapeHtml(p.id)}" title="Löschen"><i class="bi bi-trash"></i></button>
             </div>
           </div>
@@ -283,8 +293,11 @@
 
   // Event delegation (avoids inline-onclick quoting issues)
   $('productGrid').addEventListener('click', e => {
+    const card=e.target.closest('[data-open-product]');
+    if(card && !e.target.closest('button')){openProductDetails(card.dataset.openProduct);return;}
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
+    if(btn.dataset.action==='cart'){addToCart(btn.dataset.id);return;}
     if (btn.dataset.action === 'edit') openEditModal(btn.dataset.id);
     if (btn.dataset.action === 'delete') deleteProduct(btn.dataset.id);
   });
@@ -333,6 +346,7 @@
 
   /* ---------- Cloud / export ---------- */
   function saveCloudEndpoint() {
+    const aiUrl=$('aiEndpointInput')?.value.trim();if(aiUrl)localStorage.setItem(AI_URL_KEY,aiUrl);else localStorage.removeItem(AI_URL_KEY);
     const url = $('cloudEndpointInput').value.trim();
     if (url) {
       localStorage.setItem(CLOUD_URL_KEY, url);
@@ -340,7 +354,6 @@
       alert('Online-Endpoint gespeichert!');
     } else {
       localStorage.removeItem(CLOUD_URL_KEY);
-      updateSyncStatus('local', 'Lokal automatisch gespeichert');
       alert('Online-Endpoint entfernt.');
     }
   }
@@ -389,3 +402,101 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
+
+  /* ---------- Themes ---------- */
+  const THEME_KEY='scanshop_theme', AI_URL_KEY='scanshop_ai_endpoint';
+  let areaMap=null, areaCircle=null, areaCenter=null, cart=[];
+  function setTheme(theme){
+    document.documentElement.dataset.theme=theme;
+    localStorage.setItem(THEME_KEY,theme);
+    document.querySelectorAll('.theme-option').forEach(b=>{
+      const on=b.dataset.themeOption===theme;
+      b.classList.toggle('active',on);
+      b.setAttribute('aria-current',on?'true':'false');
+    });
+  }
+  /* ---------- OCR, barcode and optional real-world enrichment ---------- */
+  async function readBarcode(img){
+    try{
+      if(!('BarcodeDetector' in window))return '';
+      const detector=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','code_39','qr_code']});
+      const codes=await detector.detect(img);return codes[0]?.rawValue||'';
+    }catch(e){return '';}
+  }
+  async function enrichProductFromImage(img, barcode){
+    const endpoint=localStorage.getItem(AI_URL_KEY);
+    if(!endpoint)return null;
+    try{
+      const response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:currentImageDataUrl,barcode,area:$('areaSearch')?.value||'',language:document.documentElement.lang})});
+      if(!response.ok)throw new Error('Enrichment API returned '+response.status);
+      return await response.json();
+    }catch(e){console.warn('AI enrichment unavailable',e);return null;}
+  }
+  function addOcrText(text){
+    const clean=(text||'').replace(/\s+/g,' ').trim();if(!clean)return '';
+    return clean.slice(0,1200);
+  }
+  /* ---------- Geofencing map ---------- */
+  function initAreaMap(){
+    if(!window.L||areaMap)return;
+    areaMap=L.map('areaMap').setView([51.0504,13.7373],11);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(areaMap);
+    areaMap.on('click',e=>setAreaCenter(e.latlng.lat,e.latlng.lng));
+  }
+  function setAreaCenter(lat,lng){
+    areaCenter={lat,lng};const radius=(Number($('geoRadius').value)||15)*1000;
+    if(areaCircle)areaMap.removeLayer(areaCircle);
+    areaCircle=L.circle([lat,lng],{radius,color:'#c9a227',fillOpacity:.12}).addTo(areaMap);
+    areaMap.setView([lat,lng],11);$('areaStatus').textContent=`Geofence center: ${lat.toFixed(4)}, ${lng.toFixed(4)} · ${radius/1000} km`;
+    renderProducts();
+  }
+  function locateUser(){
+    if(!navigator.geolocation){alert('Geolocation is not supported.');return;}
+    navigator.geolocation.getCurrentPosition(pos=>{setAreaCenter(pos.coords.latitude,pos.coords.longitude);$('areaSearch').value='Current location';},()=>alert('Could not access location. Please allow location access or select an area on the map.'));
+  }
+  async function applyAreaSearch(){
+    const query=$('areaSearch').value.trim();if(!query){alert('Enter an area or click the map to set a geofence.');return;}
+    try{
+      const r=await fetch('https://nominatim.openstreetmap.org/search?format=json&q='+encodeURIComponent(query));
+      const data=await r.json();if(!data.length)throw new Error('No result');
+      setAreaCenter(Number(data[0].lat),Number(data[0].lon));
+    }catch(e){$('areaStatus').textContent='Area could not be resolved. Click the map or use your location.';}
+  }
+  function distanceKm(a,b,c,d){const rad=x=>x*Math.PI/180,R=6371;const x=rad(c-a),y=rad(d-b);const h=Math.sin(x/2)**2+Math.cos(rad(a))*Math.cos(rad(c))*Math.sin(y/2)**2;return 2*R*Math.asin(Math.sqrt(h));}
+  function inGeofence(p){if(!areaCenter||p.lat==null||p.lng==null)return true;return distanceKm(areaCenter.lat,areaCenter.lng,Number(p.lat),Number(p.lng))<=(Number($('geoRadius').value)||15);}
+  /* ---------- Product detail, seller locations and cart ---------- */
+  function openProductDetails(id){
+    const p=products.find(x=>x.id===id);if(!p)return;
+    $('detailTitle').textContent=p.name;
+    $('detailBody').innerHTML=`<div class="row g-3"><div class="col-md-5"><img src="${escapeHtml(p.image||PLACEHOLDER_IMG)}" class="img-fluid rounded-3" alt="${escapeHtml(p.name)}"></div><div class="col-md-7"><div class="fs-4 fw-bold">${(Number(p.price)||0).toFixed(2)} €</div><p>${escapeHtml(p.description||'')}</p><p class="small text-muted">SKU: ${escapeHtml(p.sku||'—')} · ISBN/EAN: ${escapeHtml(p.isbn||'—')}</p><p class="small">Seller: ${escapeHtml(p.seller||'Independent seller')}<br>Location: ${escapeHtml(p.location||'Not provided')}</p><button class="btn btn-primary-shop" onclick="addToCart('${p.id}')"><i class="bi bi-cart-plus me-1"></i>Add to cart</button></div></div><div class="mt-3"><strong>Seller / product location</strong><div id="detailMap" class="mt-2"></div></div>`;
+    bootstrap.Modal.getOrCreateInstance($('productDetailModal')).show();
+    setTimeout(()=>{if(window.L){const m=L.map('detailMap').setView([p.lat??51.0504,p.lng??13.7373],p.lat?13:5);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OpenStreetMap'}).addTo(m);if(p.lat&&p.lng)L.marker([p.lat,p.lng]).addTo(m).bindPopup(escapeHtml(p.seller||p.name)).openPopup();}},250);
+  }
+  function addToCart(id){const p=products.find(x=>x.id===id);if(!p)return;const item=cart.find(x=>x.id===id);if(item)item.qty++;else cart.push({id,qty:1});renderCart();bootstrap.Modal.getOrCreateInstance($('cartModal')).show();}
+  function renderCart(){
+    $('cartCount').textContent=cart.reduce((s,x)=>s+x.qty,0);
+    $('cartItems').innerHTML=cart.length?cart.map(x=>{const p=products.find(y=>y.id===x.id);return p?`<div class="cart-line d-flex justify-content-between gap-2"><div><strong>${escapeHtml(p.name)}</strong><div class="small text-muted">${x.qty} × ${(Number(p.price)||0).toFixed(2)} €</div></div><div><button class="btn btn-sm btn-outline-secondary" onclick="changeCartQty('${x.id}',-1)">−</button> <button class="btn btn-sm btn-outline-secondary" onclick="changeCartQty('${x.id}',1)">+</button></div></div>`:''}).join(''):'<p class="text-muted">Your cart is empty.</p>';
+    const total=cart.reduce((s,x)=>{const p=products.find(y=>y.id===x.id);return s+(p?(Number(p.price)||0)*x.qty:0);},0);$('cartTotal').textContent=total.toFixed(2)+' €';
+  }
+  function changeCartQty(id,d){const x=cart.find(y=>y.id===id);if(x){x.qty+=d;if(x.qty<=0)cart=cart.filter(y=>y.id!==id);}renderCart();}
+  function checkoutDemo(){
+    if(!cart.length){alert('Your cart is empty.');return;}
+    const method=$('paymentMethod').value,fulfilment=$('fulfilment').value;
+    if(fulfilment==='delivery'&&!$('checkoutAddress').value.trim()){alert('Please enter a delivery address.');return;}
+    if(method==='stripe'||method==='paypal'){alert('A secure server-side Stripe/PayPal integration is required. No payment has been taken.');return;}
+    const order={id:'demo_'+Date.now(),name:$('checkoutName').value,fulfilment,items:cart,createdAt:new Date().toISOString()};
+    const orders=JSON.parse(localStorage.getItem('scanshop_demo_orders')||'[]');orders.push(order);localStorage.setItem('scanshop_demo_orders',JSON.stringify(orders));cart=[];renderCart();alert('Demo order saved locally. No payment was collected.');
+  }
+  /* ---------- Demo account and seller dashboard ---------- */
+  function demoRegister(){const email=$('accountEmail').value.trim(),pw=$('accountPassword').value;if(!email||pw.length<8){alert('Enter an email and a password with at least 8 characters.');return;}const users=JSON.parse(localStorage.getItem('scanshop_demo_users')||'{}');if(users[email]){alert('Account already exists.');return;}users[email]={password:pw};localStorage.setItem('scanshop_demo_users',JSON.stringify(users));localStorage.setItem('scanshop_demo_session',email);updateAccountStatus();}
+  function demoLogin(){const email=$('accountEmail').value.trim(),pw=$('accountPassword').value,users=JSON.parse(localStorage.getItem('scanshop_demo_users')||'{}');if(users[email]?.password===pw){localStorage.setItem('scanshop_demo_session',email);updateAccountStatus();}else alert('Invalid demo credentials.');}
+  function demoLogout(){localStorage.removeItem('scanshop_demo_session');updateAccountStatus();}
+  function updateAccountStatus(){const email=localStorage.getItem('scanshop_demo_session');$('accountStatus').textContent=email?'Signed in as '+email:'Not signed in';}
+  function changeDemoPassword(){const email=localStorage.getItem('scanshop_demo_session'),pw=$('newPassword').value;if(!email){alert('Sign in first.');return;}if(pw.length<8){alert('Use at least 8 characters.');return;}const users=JSON.parse(localStorage.getItem('scanshop_demo_users')||'{}');users[email].password=pw;localStorage.setItem('scanshop_demo_users',JSON.stringify(users));$('newPassword').value='';alert('Demo password updated locally.');}
+  function saveSellerProfile(){const email=localStorage.getItem('scanshop_demo_session');if(!email){alert('Sign in first.');return;}const profile={company:$('sellerCompany').value,location:$('sellerLocation').value,lat:$('sellerLat').value?Number($('sellerLat').value):null,lng:$('sellerLng').value?Number($('sellerLng').value):null};localStorage.setItem('scanshop_seller_'+email,JSON.stringify(profile));$('sellerStatus').textContent='Seller profile saved in this browser.';}
+  /* ---------- Optional server-side product and local price matching ---------- */
+  async function estimateLocalPrice(name,area){
+    const endpoint=localStorage.getItem(AI_URL_KEY);if(!endpoint)return null;
+    try{const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'price-estimate',name,area:area||$('areaSearch').value, currency:'EUR'})});if(!r.ok)return null;return await r.json();}catch(e){return null;}
+  }
+  
